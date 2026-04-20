@@ -1,0 +1,51 @@
+{
+  "name": "pi-usage",
+  "version": "0.1.0",
+  "description": "Usage limit checker for pi coding agent — shows Codex and OpenCode Go limits at startup",
+  "license": "MIT",
+  "type": "module",
+  "main": "index.ts",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "pi",
+    "pi-package",
+    "pi-extension",
+    "usage",
+    "rate-limits",
+    "codex",
+    "opencode",
+    "opencode-go",
+    "monitoring"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/timm-u/pi-usage.git"
+  },
+  "homepage": "https://github.com/timm-u/pi-usage",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-coding-agent": "^0.67.68",
+    "@mariozechner/pi-ai": "^0.67.68",
+    "@mariozechner/pi-tui": "^0.67.68",
+    "@sinclair/typebox": "^0.34.44",
+    "@types/node": "^24.3.0",
+    "typescript": "^5.7.3"
+  }
+}
