@@ -8,7 +8,8 @@
  *
  * Setup:
  *   Codex:        Uses OAuth token from pi's auth.json (same as openai-codex provider)
- *   OpenCode Go:  Uses OPENCODE_API_KEY env var
+ *   OpenCode Go:  Uses OPENCODE_API_KEY for model probes, plus optional
+ *                 OPENCODE_GO_WORKSPACE_ID + OPENCODE_GO_AUTH_COOKIE for quota
  */
 
 import * as fs from "node:fs";
@@ -72,7 +73,35 @@ interface OpenCodeGoUsage {
 	rateLimitedModel?: string;
 	checkedModels?: number;
 	totalModels?: number;
+	quotaConfigured?: boolean;
+	quotaSource?: string;
+	monthlyUsedPercent?: number;
+	monthlyRemainingPercent?: number;
+	monthlyResetAfterSeconds?: number;
+	monthlyResetAt?: number;
+	quotaError?: string;
 	errorMessage?: string;
+	error?: string;
+}
+
+interface OpenCodeGoQuotaConfig {
+	workspaceId: string;
+	authCookie: string;
+	source: string;
+}
+
+interface OpenCodeGoQuotaConfigState {
+	config?: OpenCodeGoQuotaConfig;
+	error?: string;
+}
+
+interface OpenCodeGoQuotaResult {
+	configured: boolean;
+	source?: string;
+	monthlyUsedPercent?: number;
+	monthlyRemainingPercent?: number;
+	monthlyResetAfterSeconds?: number;
+	monthlyResetAt?: number;
 	error?: string;
 }
 
@@ -83,6 +112,8 @@ const CHECK_TIMEOUT_MS = 15_000;
 const AUTO_REFRESH_MINUTES = parseEnvInt("PI_USAGE_REFRESH_MIN", 30);
 const CODEX_REFRESH_SKEW_MS = 60_000;
 const CODEX_PROBE_MODEL = "gpt-5.4-mini";
+const OPENCODE_GO_QUOTA_CONFIG_FILE = path.join("opencode-quota", "opencode-go.json");
+const OPENCODE_GO_DASHBOARD_URL_PREFIX = "https://opencode.ai/workspace";
 
 // OpenCode Go publishes a fixed dollar limit, but no public usage/balance API.
 // These are used only as the probe fallback when the installed pi model registry
@@ -119,6 +150,80 @@ function readAuthJson(): AuthJson | undefined {
 	} catch {
 		return undefined;
 	}
+}
+
+function dedupe(list: string[]): string[] {
+	const out: string[] = [];
+	const seen = new Set<string>();
+	for (const item of list) {
+		if (!item || seen.has(item)) continue;
+		seen.add(item);
+		out.push(item);
+	}
+	return out;
+}
+
+function configPathCandidates(fileName: string): string[] {
+	const home = os.homedir();
+	const candidates: string[] = [];
+	const explicit = process.env.OPENCODE_GO_QUOTA_CONFIG?.trim();
+	if (explicit) candidates.push(explicit);
+
+	const xdgConfig = process.env.XDG_CONFIG_HOME?.trim();
+	if (xdgConfig) candidates.push(path.join(xdgConfig, "opencode", fileName));
+	candidates.push(path.join(home, ".config", "opencode", fileName));
+
+	if (process.platform === "win32") {
+		const appData = process.env.APPDATA?.trim() || path.join(home, "AppData", "Roaming");
+		const localAppData = process.env.LOCALAPPDATA?.trim() || path.join(home, "AppData", "Local");
+		candidates.push(path.join(appData, "opencode", fileName));
+		candidates.push(path.join(localAppData, "opencode", fileName));
+	} else if (process.platform === "darwin") {
+		candidates.push(path.join(home, "Library", "Application Support", "opencode", fileName));
+	}
+
+	return dedupe(candidates);
+}
+
+function getOpenCodeGoQuotaConfig(): OpenCodeGoQuotaConfigState {
+	const workspaceId = process.env.OPENCODE_GO_WORKSPACE_ID?.trim();
+	const authCookie = process.env.OPENCODE_GO_AUTH_COOKIE?.trim();
+	if (workspaceId || authCookie) {
+		if (workspaceId && authCookie) {
+			return { config: { workspaceId, authCookie, source: "env" } };
+		}
+		return {
+			error: "OpenCode Go quota env needs both OPENCODE_GO_WORKSPACE_ID and OPENCODE_GO_AUTH_COOKIE",
+		};
+	}
+
+	for (const configPath of configPathCandidates(OPENCODE_GO_QUOTA_CONFIG_FILE)) {
+		if (!fs.existsSync(configPath)) continue;
+		try {
+			const parsed = JSON.parse(fs.readFileSync(configPath, "utf8")) as {
+				workspaceId?: unknown;
+				authCookie?: unknown;
+			};
+			const fileWorkspaceId = typeof parsed.workspaceId === "string" ? parsed.workspaceId.trim() : "";
+			const fileAuthCookie = typeof parsed.authCookie === "string" ? parsed.authCookie.trim() : "";
+			if (!fileWorkspaceId || !fileAuthCookie) {
+				return { error: `${configPath} needs workspaceId and authCookie` };
+			}
+			return {
+				config: {
+					workspaceId: fileWorkspaceId,
+					authCookie: fileAuthCookie,
+					source: configPath,
+				},
+			};
+		} catch (e: unknown) {
+			return {
+				error: `${configPath}: ${e instanceof Error ? e.message : String(e)}`,
+			};
+		}
+	}
+
+	return {};
 }
 
 function writeAuthJson(auth: AuthJson): void {
@@ -387,6 +492,103 @@ async function checkCodexUsage(token: string, accountId: string): Promise<CodexU
 
 // ───────── OpenCode Go Usage Check ─────────
 
+function clampPercent(percent: number): number {
+	if (!Number.isFinite(percent)) return 0;
+	return Math.max(0, Math.min(100, percent));
+}
+
+function parseOpenCodeGoMonthlyUsage(html: string): Omit<OpenCodeGoQuotaResult, "configured" | "source"> | undefined {
+	const patterns: Array<{ regex: RegExp; usageIndex: number; resetIndex: number }> = [
+		{
+			regex: /monthlyUsage:\$R\[\d+\]=\{[^}]*usagePercent:(\d+(?:\.\d+)?)[^}]*resetInSec:(\d+(?:\.\d+)?)[^}]*\}/,
+			usageIndex: 1,
+			resetIndex: 2,
+		},
+		{
+			regex: /monthlyUsage:\$R\[\d+\]=\{[^}]*resetInSec:(\d+(?:\.\d+)?)[^}]*usagePercent:(\d+(?:\.\d+)?)[^}]*\}/,
+			usageIndex: 2,
+			resetIndex: 1,
+		},
+	];
+
+	for (const pattern of patterns) {
+		const match = pattern.regex.exec(html);
+		if (!match) continue;
+
+		const monthlyUsedPercent = clampPercent(Number(match[pattern.usageIndex]));
+		const monthlyResetAfterSeconds = Math.max(0, Math.round(Number(match[pattern.resetIndex])));
+		return {
+			monthlyUsedPercent,
+			monthlyRemainingPercent: clampPercent(100 - monthlyUsedPercent),
+			monthlyResetAfterSeconds,
+			monthlyResetAt: Math.round(Date.now() / 1000) + monthlyResetAfterSeconds,
+		};
+	}
+
+	return undefined;
+}
+
+async function fetchOpenCodeGoQuota(config: OpenCodeGoQuotaConfig): Promise<OpenCodeGoQuotaResult> {
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), CHECK_TIMEOUT_MS);
+
+	try {
+		const response = await fetch(
+			`${OPENCODE_GO_DASHBOARD_URL_PREFIX}/${encodeURIComponent(config.workspaceId)}/go`,
+			{
+				headers: {
+					"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+					"Cookie": `auth=${config.authCookie}`,
+					"User-Agent": `pi-usage (${os.platform()} ${os.release()}; ${os.arch()})`,
+				},
+				signal: controller.signal,
+			},
+		);
+
+		if (!response.ok) {
+			return {
+				configured: true,
+				source: config.source,
+				error: `OpenCode Go quota dashboard returned HTTP ${response.status}`,
+			};
+		}
+
+		const html = await response.text();
+		const parsed = parseOpenCodeGoMonthlyUsage(html);
+		if (!parsed) {
+			return {
+				configured: true,
+				source: config.source,
+				error: "OpenCode Go quota data was not found in the dashboard response",
+			};
+		}
+
+		return {
+			configured: true,
+			source: config.source,
+			...parsed,
+		};
+	} catch (e: unknown) {
+		return {
+			configured: true,
+			source: config.source,
+			error: e instanceof Error ? e.message : String(e),
+		};
+	} finally {
+		clearTimeout(timeout);
+	}
+}
+
+async function checkOpenCodeGoQuota(state: OpenCodeGoQuotaConfigState): Promise<OpenCodeGoQuotaResult> {
+	if (state.error) {
+		return { configured: false, error: state.error };
+	}
+	if (!state.config) {
+		return { configured: false };
+	}
+	return fetchOpenCodeGoQuota(state.config);
+}
+
 function resolveModelEndpoint(baseUrl: string, api: GoProbeApi): string {
 	const normalized = baseUrl.replace(/\/+$/, "");
 	if (api === "anthropic-messages") {
@@ -473,7 +675,14 @@ async function probeOpenCodeGoModel(apiKey: string, model: GoCheckModel, signal:
 	});
 }
 
-async function checkOpenCodeGoUsage(apiKey: string): Promise<OpenCodeGoUsage> {
+async function checkOpenCodeGoModels(apiKey: string | undefined): Promise<OpenCodeGoUsage> {
+	if (!apiKey) {
+		return {
+			available: false,
+			status: "no_key",
+		};
+	}
+
 	const models = getOpenCodeGoCheckModels();
 	let checkedModels = 0;
 	let lastRateLimit: { model: string; message: string } | undefined;
@@ -580,6 +789,27 @@ async function checkOpenCodeGoUsage(apiKey: string): Promise<OpenCodeGoUsage> {
 	}
 }
 
+async function checkOpenCodeGoUsage(
+	apiKey: string | undefined,
+	quotaState: OpenCodeGoQuotaConfigState,
+): Promise<OpenCodeGoUsage> {
+	const [modelCheck, quotaCheck] = await Promise.all([
+		checkOpenCodeGoModels(apiKey),
+		checkOpenCodeGoQuota(quotaState),
+	]);
+
+	return {
+		...modelCheck,
+		quotaConfigured: quotaCheck.configured,
+		quotaSource: quotaCheck.source,
+		monthlyUsedPercent: quotaCheck.monthlyUsedPercent,
+		monthlyRemainingPercent: quotaCheck.monthlyRemainingPercent,
+		monthlyResetAfterSeconds: quotaCheck.monthlyResetAfterSeconds,
+		monthlyResetAt: quotaCheck.monthlyResetAt,
+		quotaError: quotaCheck.error,
+	};
+}
+
 // ───────── Widget Rendering ─────────
 
 function buildUsageWidget(
@@ -670,6 +900,24 @@ function buildUsageWidget(
 			no_key: "no key",
 		};
 		lines.push(`${theme.fg(goColor, `${icon} OpenCode Go`)} ${theme.fg("dim", "— " + statusText[go.status])}`);
+		if (go.monthlyUsedPercent !== undefined) {
+			const monthlyColor = usageColor(go.monthlyUsedPercent);
+			const monthlyBar = progressBar(go.monthlyUsedPercent);
+			const reset = go.monthlyResetAt
+				? ` resets ${formatResetTime(go.monthlyResetAt)}`
+				: go.monthlyResetAfterSeconds !== undefined
+					? ` resets in ${formatDuration(go.monthlyResetAfterSeconds)}`
+					: "";
+			const remaining = go.monthlyRemainingPercent !== undefined
+				? ` / ${go.monthlyRemainingPercent.toFixed(0)}% left`
+				: "";
+			lines.push(
+				`  month ${theme.fg(monthlyColor, monthlyBar)} ${theme.fg(monthlyColor, `${go.monthlyUsedPercent.toFixed(0)}% used`)}${theme.fg("dim", remaining + reset)}`,
+			);
+		}
+		if (go.quotaError) {
+			lines.push(`  ${theme.fg("dim", `quota: ${go.quotaError.substring(0, 80)}`)}`);
+		}
 		if (go.workingModel) {
 			lines.push(`  ${theme.fg("dim", `working: ${go.workingModel}`)}`);
 		}
@@ -703,7 +951,11 @@ function updateFooterStatus(ctx: any, codex: CodexUsage | undefined, go: OpenCod
 		parts.push(`Codex:${codex!.primaryUsedPercent.toFixed(0)}%/${codex!.secondaryUsedPercent.toFixed(0)}%`);
 	}
 	if (go) {
-		parts.push(`Go:${go.available ? "✓" : "⏳"}`);
+		if (go.monthlyUsedPercent !== undefined) {
+			parts.push(`Go:${go.monthlyUsedPercent.toFixed(0)}%m`);
+		} else {
+			parts.push(`Go:${statusIcon(go.status)}`);
+		}
 	}
 	if (parts.length > 0) {
 		ctx.ui.setStatus("pi-usage", `⚡ ${parts.join(" │ ")}`);
@@ -751,12 +1003,15 @@ export default function (pi: ExtensionAPI) {
 
 		// Check OpenCode Go
 		const goKey = getOpenCodeApiKey();
-		if (goKey) {
+		const goQuotaState = getOpenCodeGoQuotaConfig();
+		if (goKey || goQuotaState.config || goQuotaState.error) {
 			checks.push(
-				checkOpenCodeGoUsage(goKey).then((result) => {
+				checkOpenCodeGoUsage(goKey, goQuotaState).then((result) => {
 					goUsage = result;
 				}),
 			);
+		} else {
+			goUsage = undefined;
 		}
 
 		// Run checks in parallel
@@ -781,7 +1036,11 @@ export default function (pi: ExtensionAPI) {
 				parts.push(`Codex: ✗ ${codexUsage.error.substring(0, 30)}`);
 			}
 			if (goUsage) {
-				parts.push(`Go: ${goUsage.available ? "✓" : "⏳"}`);
+				if (goUsage.monthlyUsedPercent !== undefined) {
+					parts.push(`Go month:${goUsage.monthlyUsedPercent.toFixed(0)}%`);
+				} else {
+					parts.push(`Go: ${statusIcon(goUsage.status)}`);
+				}
 			}
 			if (parts.length > 0) {
 				ctx.ui.notify(`⚡ ${parts.join(" │ ")}`, "info");

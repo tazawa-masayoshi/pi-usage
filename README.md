@@ -12,7 +12,9 @@ When pi starts up, **pi-usage** automatically:
    - Reset times for both windows
    - Plan type, active limit, and credits info
 
-2. **OpenCode Go** — Probes available Go models to check:
+2. **OpenCode Go** — Checks the dashboard quota and probes available Go models to show:
+   - **Monthly usage percentage** from the OpenCode Go dashboard, when configured
+   - Monthly reset time
    - Whether Go models are **available** or **rate limited**
    - Which specific model is working
    - Error details if credits are exhausted
@@ -74,6 +76,38 @@ export OPENCODE_API_KEY="your-key-here"
 
 `pi-usage` checks `~/.pi/agent/auth.json` first (`opencode-go`, then `opencode`) and falls back to `OPENCODE_API_KEY`.
 
+For the monthly usage percentage, pi-usage can also read the OpenCode Go dashboard. This needs your OpenCode workspace id and the `auth` cookie from your browser session:
+
+```bash
+export OPENCODE_GO_WORKSPACE_ID="your-workspace-id"
+export OPENCODE_GO_AUTH_COOKIE="your-auth-cookie-value"
+```
+
+You can also store the same values in an OpenCode quota config file:
+
+```json
+{
+  "workspaceId": "your-workspace-id",
+  "authCookie": "your-auth-cookie-value"
+}
+```
+
+Config file locations checked:
+
+- `OPENCODE_GO_QUOTA_CONFIG`, if set
+- `$XDG_CONFIG_HOME/opencode/opencode-quota/opencode-go.json`
+- `~/.config/opencode/opencode-quota/opencode-go.json`
+- Windows: `%APPDATA%\opencode\opencode-quota\opencode-go.json`
+- Windows: `%LOCALAPPDATA%\opencode\opencode-quota\opencode-go.json`
+- macOS: `~/Library/Application Support/opencode/opencode-quota/opencode-go.json`
+
+To find the values:
+
+- `workspaceId` is the id in `https://opencode.ai/workspace/<workspaceId>/go`
+- `authCookie` is the value of the `auth` cookie for `opencode.ai` in your browser devtools
+
+The cookie is sensitive. Prefer environment variables or the local config file; do not commit it.
+
 ## Usage
 
 ### Automatic
@@ -94,6 +128,7 @@ Codex (plus) [premium]
   week  ████████████░░░░░░░░ 62% resets in 3.8d
 ────────────────────────────────────────
 ✓ OpenCode Go — available
+  month ████████████░░░░░░░░ 60% used / 40% left resets 12.4d
   working: glm-5.1
 ```
 
@@ -121,20 +156,24 @@ pi-usage makes a **minimal streaming request** (model: `gpt-5.4-mini`, instructi
 
 ### OpenCode Go
 
-OpenCode Go does not currently expose a usage/balance API. pi-usage probes models by making minimal requests (`max_tokens: 1`) and checking for:
+OpenCode Go does not currently expose a public usage/balance API. pi-usage can scrape the authenticated dashboard page at `https://opencode.ai/workspace/<workspaceId>/go` and parse the embedded monthly quota data when `OPENCODE_GO_WORKSPACE_ID` and `OPENCODE_GO_AUTH_COOKIE` are configured.
+
+Separately, pi-usage probes models by making minimal requests (`max_tokens: 1`) and checking for:
 - **200 OK** → model is available
 - **429** → rate limited
 - **401/403** → credits error or auth issue
 
 It builds the probe list from OpenCode's documented Go models, then adds any extra `opencode-go` models from pi's installed registry. It tries cheaper models first and stops at the first success or definitive global quota/auth error.
 
-OpenCode Go's published limits are dollar-based (`$12` per 5 hours, `$30` per week, `$60` per month). There is no public API for the current remaining balance; OpenCode documents that current usage is tracked in the console. This extension therefore reports availability/limit blocking, not an exact percentage remaining for Go.
-
 ## Configuration
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PI_USAGE_REFRESH_MIN` | `30` | Auto-refresh interval in minutes |
+| `OPENCODE_API_KEY` | unset | OpenCode API key used for model availability probes |
+| `OPENCODE_GO_WORKSPACE_ID` | unset | Workspace id from the OpenCode Go dashboard URL |
+| `OPENCODE_GO_AUTH_COOKIE` | unset | Browser `auth` cookie value for `opencode.ai`, used for monthly quota scraping |
+| `OPENCODE_GO_QUOTA_CONFIG` | unset | Optional explicit path to an `opencode-go.json` quota config file |
 
 ## License
 
