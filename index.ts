@@ -1107,9 +1107,6 @@ function buildUsageWidget(
 				lines.push(`  ${theme.fg("warning", `⚠ 5hr exceeds weekly allocation: ${codex.primaryOverSecondaryLimitPercent}%`)}`);
 			}
 		}
-	} else {
-		lines.push(theme.fg("dim", sep.repeat(40)));
-		lines.push(theme.fg("dim", "Codex — not configured"));
 	}
 
 	// ── OpenCode Go ──
@@ -1132,45 +1129,7 @@ function buildUsageWidget(
 			no_key: "no key",
 		};
 		lines.push(`${theme.fg(goColor, `${icon} OpenCode Go`)} ${theme.fg("dim", "— " + statusText[go.status])}`);
-		const goWindows = [
-			{
-				label: "rolling",
-				used: go.rollingUsedPercent,
-				remaining: go.rollingRemainingPercent,
-				resetAt: go.rollingResetAt,
-				resetAfterSeconds: go.rollingResetAfterSeconds,
-			},
-			{
-				label: "week",
-				used: go.weeklyUsedPercent,
-				remaining: go.weeklyRemainingPercent,
-				resetAt: go.weeklyResetAt,
-				resetAfterSeconds: go.weeklyResetAfterSeconds,
-			},
-			{
-				label: "month",
-				used: go.monthlyUsedPercent,
-				remaining: go.monthlyRemainingPercent,
-				resetAt: go.monthlyResetAt,
-				resetAfterSeconds: go.monthlyResetAfterSeconds,
-			},
-		];
-		for (const window of goWindows) {
-			if (window.used === undefined) continue;
-			const windowColor = usageColor(window.used);
-			const windowBar = progressBar(window.used);
-			const reset = window.resetAt
-				? ` resets ${formatResetTime(window.resetAt)}`
-				: window.resetAfterSeconds !== undefined
-					? ` resets in ${formatDuration(window.resetAfterSeconds)}`
-					: "";
-			const remaining = window.remaining !== undefined
-				? ` / ${window.remaining.toFixed(0)}% left`
-				: "";
-			lines.push(
-				`  ${window.label.padEnd(7)} ${theme.fg(windowColor, windowBar)} ${theme.fg(windowColor, `${window.used.toFixed(0)}% used`)}${theme.fg("dim", remaining + reset)}`,
-			);
-		}
+		// Detailed usage windows moved to status line (footer)
 		if (go.quotaError) {
 			lines.push(`  ${theme.fg("dim", `quota: ${go.quotaError.substring(0, 80)}`)}`);
 		}
@@ -1189,9 +1148,6 @@ function buildUsageWidget(
 		if (go.error) {
 			lines.push(`  ${theme.fg("dim", go.error.substring(0, 80))}`);
 		}
-	} else {
-		lines.push(theme.fg("dim", sep.repeat(40)));
-		lines.push(theme.fg("dim", "OpenCode Go — not configured"));
 	}
 
 	return new Text(lines.join("\n"), 0, 0);
